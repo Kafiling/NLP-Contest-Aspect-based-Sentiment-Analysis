@@ -1,17 +1,19 @@
 """
-RoBERTa v2 — Joint Training + Class Weights + Per-class Threshold Tuning
-                + Data Augmentation + Label Smoothing
+RoBERTa v3 — v2 + Text Cleaning + Stratified Split
 
-Improvements over v1:
-  1. Joint training      — single shared RoBERTa encoder with two heads trained
-                           simultaneously (aspect + sentiment loss combined each step)
-  2. Class weights       — inverse-frequency weights on CrossEntropyLoss to fix
-                           under-represented sentiments (esp. 'conflict')
-  3. Per-class threshold — grid search over [0.10, 0.95] per aspect on dev set
-                           to maximise per-aspect F1 independently
-  4. Data augmentation   — oversample minority sentiment classes in training set
-                           before building the sentiment DataLoader
-  5. Label smoothing     — CrossEntropyLoss(label_smoothing=0.1) on sentiment head
+Improvements over v2:
+  + Text cleaning        — lowercase + whitespace normalisation applied to all
+                           text before tokenisation
+  + Stratified split     — train/dev split stratified by each sentence's dominant
+                           aspect so all aspect classes are proportionally
+                           represented in both splits
+
+Inherited from v2:
+  1. Joint training      — shared RoBERTa encoder, two heads, combined loss
+  2. Class weights       — inverse-frequency weights on CrossEntropyLoss
+  3. Per-class threshold — per-aspect sigmoid threshold tuned on dev set
+  4. Data augmentation   — oversample minority sentiment classes
+  5. Label smoothing     — CrossEntropyLoss(label_smoothing=0.1)
 """
 
 import os
@@ -59,11 +61,60 @@ ID2SENT    = {i: s for s, i in SENT2ID.items()}
 DATA_DIR     = os.path.join(os.path.dirname(__file__), 'Resource')
 TRAIN_FILE   = os.path.join(DATA_DIR, 'contest1_train.csv')
 TEST_FILE    = os.path.join(DATA_DIR, 'contest1_test.csv')
-OUT_FILE     = os.path.join(DATA_DIR, 'roberta_v2_test_pred.csv')
-DEV_OUT_FILE = os.path.join(DATA_DIR, 'roberta_v2_dev_pred.csv')
+OUT_FILE     = os.path.join(DATA_DIR, 'roberta_v3_test_pred.csv')
+DEV_OUT_FILE = os.path.join(DATA_DIR, 'roberta_v3_dev_pred.csv')
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
+
+
+# ── Text cleaning ─────────────────────────────────────────────────────────────
+def clean_text(text: str) -> str:
+    """Lowercase and normalise whitespace."""
+    return ' '.join(str(text).lower().split())
+
+
+# ── Stratified split by dominant aspect ──────────────────────────────────────
+def stratified_split_by_aspect(df: pd.DataFrame, test_size: float, seed: int):
+    """
+    Split unique sentence IDs into train / dev, stratified by each sentence's
+    dominant aspect (most-frequent aspect for that id; ties broken by order in
+    ASPECTS list).  Ensures every aspect appears in both splits proportionally.
+    """
+    asp_counts = (
+        df.groupby(['id', 'aspectCategory'])
+        .size()
+        .reset_index(name='cnt')
+    )
+    # For each sentence pick the aspect with the most occurrences
+    # (or the first in ASPECTS order when tied)
+    asp_counts['asp_rank'] = asp_counts['aspectCategory'].map(
+        {a: i for i, a in enumerate(ASPECTS)}
+    )
+    dominant = (
+        asp_counts
+        .sort_values(['id', 'cnt', 'asp_rank'], ascending=[True, False, True])
+        .groupby('id')
+        .first()
+        .reset_index()[['id', 'aspectCategory']]
+        .rename(columns={'aspectCategory': 'dominant_aspect'})
+    )
+
+    # Stratify; if a class has too few samples fall back to no stratification
+    try:
+        train_ids, dev_ids = train_test_split(
+            dominant['id'],
+            test_size=test_size,
+            random_state=seed,
+            stratify=dominant['dominant_aspect']
+        )
+    except ValueError:
+        print("  [warn] Stratification fallback: some aspect class too small, "
+              "using random split instead.")
+        train_ids, dev_ids = train_test_split(
+            dominant['id'], test_size=test_size, random_state=seed
+        )
+    return train_ids.tolist(), dev_ids.tolist()
 
 
 # ── Improvement 4: Data augmentation (oversample minority sentiments) ─────────
@@ -406,13 +457,19 @@ def main():
     print(f"Train rows: {len(train_df)} | Unique IDs: {train_df['id'].nunique()}")
     print(f"Test  rows: {len(test_df)}")
 
-    # ---- Train / dev split by unique sentence ID ----
-    unique_ids = train_df['id'].unique()
-    train_ids, dev_ids = train_test_split(unique_ids, test_size=DEV_SPLIT,
-                                          random_state=SEED)
+    # ---- Text cleaning (lowercase + whitespace) ----
+    train_df['text'] = train_df['text'].map(clean_text)
+    test_df['text']  = test_df['text'].map(clean_text)
+    print("Text cleaning applied (lowercase + whitespace normalisation)")
+    print(f"  Sample: {train_df['text'].iloc[0][:80]}")
+
+    # ---- Stratified train / dev split by dominant aspect ----
+    train_ids, dev_ids = stratified_split_by_aspect(train_df, DEV_SPLIT, SEED)
     tr_df  = train_df[train_df['id'].isin(train_ids)].reset_index(drop=True)
     dev_df = train_df[train_df['id'].isin(dev_ids)].reset_index(drop=True)
     print(f"Split -> train: {len(tr_df)} rows | dev: {len(dev_df)} rows")
+    print("  Dev aspect distribution:")
+    print(dev_df['aspectCategory'].value_counts().to_string(header=False))
 
     # ---- Improvement 4: Augment sentiment training data ----
     tr_sent_aug = augment_sentiment_data(tr_df)
@@ -512,7 +569,7 @@ def main():
     # ── Loss curve plot ───────────────────────────────────────────────────────
     plot_losses(
         train_losses, dev_losses,
-        os.path.join(DATA_DIR, 'roberta_v2_loss_curve.png')
+        os.path.join(DATA_DIR, 'roberta_v3_loss_curve.png')
     )
 
     # ── Improvement 3: Per-class threshold tuning ─────────────────────────────

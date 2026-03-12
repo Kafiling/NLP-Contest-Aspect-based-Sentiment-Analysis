@@ -6,3 +6,4 @@ transformers
 sentencepiece
 protobuf
 matplotlib
+gensim
